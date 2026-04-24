@@ -830,6 +830,33 @@ def relay_batch():
                     "fail_count": fail_count, "results": results})
 
 
+# ── relay-ingest — lightweight alias used by Flutter app as primary relay URL ─
+# Same logic as /relay/packet but accepts the packet directly at the top level
+# (no nesting required). The phone app can POST to either endpoint.
+
+@app.route("/relay-ingest", methods=["POST"])
+def relay_ingest():
+    err = _check_api_key()
+    if err:
+        return jsonify({"ok": False, "error": err}), 401
+
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
+
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({"ok": False, "error": "Invalid or empty JSON body"}), 400
+
+    relay_device_id = (
+        request.headers.get("X-Relay-Device-Id")
+        or str(data.get("relay_device_id", DEFAULT_RELAY_DEVICE_ID))
+    )
+
+    result = process_packet(data, relay_device_id)
+    # Always return 200 with success/received so Flutter app knows we got it
+    return jsonify({"success": result.get("ok", False), "received": data, "detail": result}), 200
+
+
 # ── Device reset endpoint — resets relay_event_written so a new relay_event
 #    is written next time (useful when Pi comes back and goes offline again) ──
 
