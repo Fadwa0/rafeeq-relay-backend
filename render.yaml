@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: rafeeq-relay
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn rafeeq_render_relay:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
