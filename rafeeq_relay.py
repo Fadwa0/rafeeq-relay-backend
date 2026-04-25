@@ -129,7 +129,7 @@ SOURCE_TYPE_PI          = "raspberry_pi"        # kept for schema compat
 SOURCE_TYPE_RELAY       = "phone_relay"
 SOURCE_PATH_RELAY       = "relay"
 PROCESSED_BY_NAME       = "Rafeeq Render Relay"
-LOCAL_DEVICE_ID         = "render-relay-node-01"
+RELAY_DEVICE_ID         = "render-relay-node-01"
 DEFAULT_RELAY_DEVICE_ID = os.getenv("RAFEEQ_DEFAULT_RELAY_DEVICE_ID", "unknown_phone_relay")
 
 HEARTBEAT_TIMEOUT_SEC    = 15.0   # same as Pi: declare Pi offline after 15 s
@@ -428,8 +428,8 @@ def write_relay_event(
                 "trigger":                 reason,
                 "pi_last_seen":            timestamp,
                 "details":                 f"Pi missed heartbeat — silent for {hb_monitor.seconds_since():.1f}s",
-                "source_type":             SOURCE_TYPE_PI,
-                "source_id":               LOCAL_DEVICE_ID,
+                "source_type":             SOURCE_TYPE_RELAY,
+                "source_id":               RELAY_DEVICE_ID,
                 "source_path":             SOURCE_PATH_RELAY,
                 "processed_by":            PROCESSED_BY_NAME,
                 "relay_source_type":       SOURCE_TYPE_RELAY,
@@ -524,8 +524,8 @@ def build_snapshot(
 
         "connection_mode":      "BLE_PHONE_RELAY",
         "source_path":          SOURCE_PATH_RELAY,
-        "source_type":          SOURCE_TYPE_PI,  # schema compat
-        "source_id":            LOCAL_DEVICE_ID,
+        "source_type":          SOURCE_TYPE_RELAY,  
+        "source_id":            RELAY_DEVICE_ID,
         "relay_source_type":    SOURCE_TYPE_RELAY,
         "relay_source_id":      relay_device_id,
         "processed_by":         PROCESSED_BY_NAME,
