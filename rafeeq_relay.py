@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-RAFEEQ — Render Cloud Relay Server v5.0
+RAFEEQ — Render Cloud Relay Server v5.1
 Role: fallback relay pipeline when Raspberry Pi fog node is offline.
 
 Flow:
   ESP32 Watch -> BLE -> Flutter Phone App -> HTTP POST -> Render -> Firebase
 
-Design copied from the Raspberry Pi fog-node logic:
+Design aligned with the Raspberry Pi fog-node logic:
   1) Receive flat or nested ESP packets from the phone relay.
   2) Validate vitals exactly like the Pi path.
   3) Apply local fusion / alert detection.
@@ -14,6 +14,12 @@ Design copied from the Raspberry Pi fog-node logic:
   5) Queue Firestore history/audit/performance/relay-event writes in SQLite.
   6) Upload queued Firestore jobs slowly in a background worker so Firestore quota
      failures never block live relay processing.
+
+Required Render env vars:
+  RAFEEQ_DATABASE_URL
+  RAFEEQ_SERVICE_ACCOUNT_JSON
+  RAFEEQ_RELAY_API_KEY optional but recommended
+  PORT is provided by Render.
 """
 
 from __future__ import annotations
@@ -405,6 +411,16 @@ class DeviceState:
         self.daily_alerts = 0
         self.daily_relay = 0
 
+        # Pi-compatible display/cache logic.
+        # When the watch is removed or a packet contains invalid zeros, Render
+        # must keep the last valid values for UI display instead of replacing
+        # vitals with zeros. This mirrors RafeeqPiFogNode.apply_worn_time_and_display_fields().
+        self.worn_day_key = ""
+        self.worn_today_sec = 0.0
+        self.last_worn_sample_time: Optional[float] = None
+        self.max_worn_gap_sec = 120.0
+        self.last_valid_reading: Dict[str, Any] = {}
+
     def duplicate_packet(self, esp_packet_id: Optional[str]) -> bool:
         if not esp_packet_id:
             return False
@@ -520,6 +536,102 @@ def local_fusion(hr: int, spo2: int, temp: float, wearing: bool, imu_candidate: 
     status = "Critical" if danger else "Warning" if warning else "Stable"
     return {"status": status, "danger": danger, "warning": warning, "flags": flags or ["Normal"]}
 
+
+
+
+def reading_valid_for_display(snap: Dict[str, Any]) -> bool:
+    """Pi-compatible display validity rule.
+
+    A reading can update the values shown to the patient only when the watch is
+    worn and core vitals are non-zero. This prevents relay mode from replacing
+    a valid dashboard value with zeros while the watch is removed.
+    """
+    try:
+        return bool(
+            snap.get("wearing") is True
+            and int(snap.get("heart_rate") or 0) > 0
+            and int(snap.get("spo2") or 0) > 0
+            and float(snap.get("temperature") or 0) > 0
+        )
+    except Exception:
+        return False
+
+
+def format_duration_sec(seconds: float) -> str:
+    total_minutes = max(0, int(seconds // 60))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours <= 0:
+        return f"{minutes}m"
+    return f"{hours}h {minutes}m"
+
+
+def apply_worn_time_and_display_fields(snap: Dict[str, Any], state: DeviceState) -> None:
+    """Mirror Raspberry Pi worn-time and cached display-value behavior."""
+    now = time.time()
+    day_key = snap.get("day_key") or utc_now_iso()[:10]
+
+    if state.worn_day_key != day_key:
+        state.worn_day_key = day_key
+        state.worn_today_sec = 0.0
+        state.last_worn_sample_time = None
+
+    reading_valid = reading_valid_for_display(snap)
+
+    if snap.get("wearing") is True and reading_valid:
+        if state.last_worn_sample_time is not None:
+            gap = max(0.0, now - state.last_worn_sample_time)
+            state.worn_today_sec += min(gap, state.max_worn_gap_sec)
+        state.last_worn_sample_time = now
+
+        state.last_valid_reading = {
+            "heart_rate": snap.get("heart_rate"),
+            "spo2": snap.get("spo2"),
+            "temperature": snap.get("temperature"),
+            "blood_pressure": snap.get("blood_pressure"),
+            "glucose": snap.get("glucose"),
+            "updated_at": snap.get("timestamp"),
+            "esp_packet_id": snap.get("esp_packet_id"),
+        }
+        display = dict(state.last_valid_reading)
+        status_label = "Live"
+
+    elif snap.get("wearing") is False:
+        state.last_worn_sample_time = None
+        display = dict(state.last_valid_reading) if state.last_valid_reading else {
+            "heart_rate": None,
+            "spo2": None,
+            "temperature": None,
+            "blood_pressure": "0/0",
+            "glucose": 0,
+            "updated_at": None,
+            "esp_packet_id": None,
+        }
+        status_label = "Cached / Watch not worn" if state.last_valid_reading else "Watch not worn"
+
+    else:
+        display = dict(state.last_valid_reading) if state.last_valid_reading else {
+            "heart_rate": None,
+            "spo2": None,
+            "temperature": None,
+            "blood_pressure": "0/0",
+            "glucose": 0,
+            "updated_at": None,
+            "esp_packet_id": None,
+        }
+        status_label = "Waiting for valid reading"
+
+    snap["reading_valid"] = reading_valid
+    snap["last_valid_reading"] = dict(state.last_valid_reading)
+    snap["display_heart_rate"] = display.get("heart_rate")
+    snap["display_spo2"] = display.get("spo2")
+    snap["display_temperature"] = display.get("temperature")
+    snap["display_blood_pressure"] = display.get("blood_pressure")
+    snap["display_glucose"] = display.get("glucose")
+    snap["display_updated_at"] = display.get("updated_at")
+    snap["reading_status_label"] = status_label
+    snap["worn_today_sec"] = int(state.worn_today_sec)
+    snap["worn_today_label"] = format_duration_sec(state.worn_today_sec)
 
 def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
     vitals = payload.get("vitals") if isinstance(payload.get("vitals"), dict) else {}
@@ -646,6 +758,15 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "temperature": snap["temperature"],
         "blood_pressure": snap["blood_pressure"],
         "glucose": snap["glucose"],
+        "display_heart_rate": snap.get("display_heart_rate"),
+        "display_spo2": snap.get("display_spo2"),
+        "display_temperature": snap.get("display_temperature"),
+        "display_blood_pressure": snap.get("display_blood_pressure"),
+        "display_glucose": snap.get("display_glucose"),
+        "display_updated_at": snap.get("display_updated_at"),
+        "reading_valid": snap.get("reading_valid", False),
+        "reading_status_label": snap.get("reading_status_label", "Waiting for valid reading"),
+        "last_valid_reading": snap.get("last_valid_reading", {}),
         "accel_x": snap["accel_x"],
         "accel_y": snap["accel_y"],
         "accel_z": snap["accel_z"],
@@ -690,6 +811,9 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "device_status": snap["device_status"],
         "medical_data_status": snap["medical_data_status"],
         "data_stale": not snap["wearing"],
+        "worn_today_sec": snap.get("worn_today_sec", 0),
+        "worn_today_label": snap.get("worn_today_label", "0m"),
+        "last_worn_update_at": snap["timestamp"],
         "source_path": snap["source_path"],
         "source_type": snap["source_type"],
         "source_id": snap["source_id"],
@@ -718,6 +842,8 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "pi_online": False,
         "firebase_reachable": fs is not None,
         "render_relay_alive": True,
+        "relay_active": True,
+        "relay_source_id": snap.get("relay_source_id"),
         "last_packet_at": snap["timestamp"],
         "operating_mode": "relay",
         **history_sync_snapshot(),
@@ -746,7 +872,10 @@ def firestore_set_job(job_type: str, uid: str, device_id: str, payload: Dict[str
         return
 
     if job_type == "perf":
+        # Primary Schema v5 path used by the Flutter app/web dashboard.
         fs.collection("users").document(uid).collection("devices").document(device_id).collection("performance_logs").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        # Compatibility with older Pi code that used perf_log.
+        fs.collection("users").document(uid).collection("devices").document(device_id).collection("perf_log").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
         return
 
     if job_type == "audit":
@@ -907,6 +1036,7 @@ def process_packet(payload: Dict[str, Any], relay_device_id: str) -> Dict[str, A
 
     write_relay_event_once(uid, device_id, relay_device_id, state)
     snap = build_snapshot(packet, relay_device_id, state)
+    apply_worn_time_and_display_fields(snap, state)
 
     phone_to_render_ms = None
     phone_sent = packet.get("phone_sent_at_epoch_ms")
