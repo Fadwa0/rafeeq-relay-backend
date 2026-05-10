@@ -4,7 +4,7 @@ RAFEEQ — Render Cloud Relay Server v5.1
 Role: fallback relay pipeline when Raspberry Pi fog node is offline.
 
 Flow:
-  ESP32 Watch -> BLE -> Flutter Phone App -> HTTP POST -> Render -> Firebase
+  ESP32 Watch -> BLE -> Flutter Phone App -> HTTP POST -> Render -> Firebase 
 
 Design aligned with the Raspberry Pi fog-node logic:
   1) Receive flat or nested ESP packets from the phone relay.
