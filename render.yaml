@@ -1,6 +1,18 @@
 services:
   - type: web
-    name: rafeeq-relay
-    runtime: python
+    name: rafeq-render-relay
+    env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn rafeeq_relay:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: RAFEEQ_LOG_LEVEL
+        value: INFO
+      - key: RAFEEQ_UPLOAD_COOLDOWN_SEC
+        value: "2"
+      - key: RAFEEQ_FIRESTORE_HISTORY_INTERVAL_SEC
+        value: "60"
+      - key: RAFEEQ_FIRESTORE_WORKER_INTERVAL_SEC
+        value: "30"
+      - key: RAFEEQ_FIRESTORE_WORKER_BATCH_SIZE
+        value: "1"
