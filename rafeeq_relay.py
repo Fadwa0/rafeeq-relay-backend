@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-RAFEEQ — Render Cloud Relay Server v5.1
+RAFEEQ — Render Cloud Relay Server v5.2 CLEAN
 Role: fallback relay pipeline when Raspberry Pi fog node is offline.
 
 Flow:
-  ESP32 Watch -> BLE -> Flutter Phone App -> HTTP POST -> Render -> Firebase 
+  ESP32 Watch -> BLE -> Flutter Phone App -> HTTP POST -> Render -> Firebase
 
-Design aligned with the Raspberry Pi fog-node logic:
-  1) Receive flat or nested ESP packets from the phone relay.
-  2) Validate vitals exactly like the Pi path.
-  3) Apply local fusion / alert detection.
-  4) Write RTDB live/{uid}/{device_id} immediately for app/web live updates.
-  5) Queue Firestore history/audit/performance/relay-event writes in SQLite.
-  6) Upload queued Firestore jobs slowly in a background worker so Firestore quota
-     failures never block live relay processing.
+Important design decision:
+  - This Render service DOES NOT track Raspberry Pi heartbeat.
+  - Raspberry Pi heartbeat belongs only to the Raspberry Pi path.
+  - Render only receives relay packets from the Flutter app, processes them using
+    Pi-compatible packet logic, and writes Firebase as relay mode.
 
 Required Render env vars:
   RAFEEQ_DATABASE_URL
@@ -90,7 +87,9 @@ def parse_bool(value: Any, default: bool = True) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "wearing", "on"}
+        return value.strip().lower() in {
+            "true", "1", "yes", "wearing", "active", "on"
+        }
     return default
 
 
@@ -101,7 +100,7 @@ def ensure_parent_dir(path: str) -> None:
 
 
 # ─────────────────────────────────────────
-# CONFIG — v5.0 schema, aligned with Pi fog node
+# CONFIG — v5 schema, relay only
 # ─────────────────────────────────────────
 
 SCHEMA_VERSION = "5.0"
@@ -109,10 +108,8 @@ SOURCE_TYPE_RELAY = "phone_relay"
 SOURCE_PATH_RELAY = "relay"
 PROCESSED_BY_NAME = "Rafeeq Render Relay"
 RELAY_NODE_ID = os.getenv("RAFEEQ_RELAY_NODE_ID", "render-relay-node-01")
-DEFAULT_RELAY_DEVICE_ID = os.getenv("RAFEEQ_DEFAULT_RELAY_DEVICE_ID", "unknown_phone_relay")
+DEFAULT_RELAY_DEVICE_ID = os.getenv("RAFEEQ_DEFAULT_RELAY_DEVICE_ID", "flutter_phone")
 
-HEARTBEAT_TIMEOUT_SEC = env_float("RAFEEQ_HEARTBEAT_TIMEOUT_SEC", 15.0)
-PI_HEARTBEAT_INTERVAL_SEC = env_float("RAFEEQ_PI_HEARTBEAT_INTERVAL_SEC", 5.0)
 UPLOAD_COOLDOWN_SEC = env_float("RAFEEQ_UPLOAD_COOLDOWN_SEC", 2.0)
 ROLLING_WINDOW_SIZE = env_int("RAFEEQ_ROLLING_WINDOW_SIZE", 10)
 DEDUP_WINDOW_SEC = env_float("RAFEEQ_DEDUP_WINDOW_SEC", 3.0)
@@ -136,15 +133,16 @@ fs: Any = None
 # FIREBASE INIT
 # ─────────────────────────────────────────
 
-
 def init_firebase() -> None:
     global fs
+
     database_url = os.getenv("RAFEEQ_DATABASE_URL", "").strip()
     service_account_json = os.getenv("RAFEEQ_SERVICE_ACCOUNT_JSON", "").strip()
 
     if not database_url:
         log.error("[FIREBASE] RAFEEQ_DATABASE_URL is missing")
         return
+
     if not service_account_json:
         log.error("[FIREBASE] RAFEEQ_SERVICE_ACCOUNT_JSON is missing")
         return
@@ -219,7 +217,7 @@ class LocalQueue:
     """SQLite-backed Firestore queue.
 
     RTDB live writes are direct. Firestore writes are queued and uploaded by a
-    worker. If quota is exceeded, the worker backs off; live relay remains alive.
+    worker. If quota is exceeded, only the worker backs off; live relay stays alive.
     """
 
     def __init__(self, path: str):
@@ -276,6 +274,7 @@ class LocalQueue:
                 "WHEN 'perf' THEN 4 WHEN 'audit' THEN 5 ELSE 9 END, created_at ASC LIMIT ?",
                 (time.time(), limit),
             ).fetchall()
+
         out = []
         for row_id, job_type, uid, device_id, payload, attempts in rows:
             try:
@@ -336,10 +335,12 @@ def history_sync_snapshot() -> Dict[str, Any]:
         err = last_firestore_error
         err_at = last_firestore_error_at
         ok_at = last_firestore_success_at
+
     if depth == 0 and status != "delayed":
         status = "ok"
     elif depth > 0 and status == "ok":
         status = "pending"
+
     return {
         "history_sync_status": status,
         "queue_depth": depth,
@@ -359,37 +360,8 @@ def enqueue_firestore_job(job_type: str, uid: Optional[str], device_id: Optional
 
 
 # ─────────────────────────────────────────
-# HEARTBEAT / DEVICE STATE
+# DEVICE STATE
 # ─────────────────────────────────────────
-
-class HeartbeatMonitor:
-    def __init__(self, timeout_sec: float):
-        self.timeout_sec = timeout_sec
-        self.lock = threading.Lock()
-        self.last_heartbeat_time: Optional[str] = None
-        self.last_heartbeat_ts: float = 0.0
-        self.last_pi_id: Optional[str] = None
-
-    def record(self, data: Optional[Dict[str, Any]] = None) -> None:
-        with self.lock:
-            self.last_heartbeat_ts = time.time()
-            self.last_heartbeat_time = utc_now_iso()
-            if data and data.get("pi_id"):
-                self.last_pi_id = str(data.get("pi_id"))
-
-    def is_alive(self) -> bool:
-        with self.lock:
-            return self.last_heartbeat_ts > 0 and (time.time() - self.last_heartbeat_ts) < self.timeout_sec
-
-    def seconds_since(self) -> float:
-        with self.lock:
-            if self.last_heartbeat_ts == 0:
-                return float("inf")
-            return time.time() - self.last_heartbeat_ts
-
-
-hb_monitor = HeartbeatMonitor(HEARTBEAT_TIMEOUT_SEC)
-
 
 class DeviceState:
     def __init__(self, device_id: str):
@@ -411,10 +383,7 @@ class DeviceState:
         self.daily_alerts = 0
         self.daily_relay = 0
 
-        # Pi-compatible display/cache logic.
-        # When the watch is removed or a packet contains invalid zeros, Render
-        # must keep the last valid values for UI display instead of replacing
-        # vitals with zeros. This mirrors RafeeqPiFogNode.apply_worn_time_and_display_fields().
+        # Pi-compatible cached display logic.
         self.worn_day_key = ""
         self.worn_today_sec = 0.0
         self.last_worn_sample_time: Optional[float] = None
@@ -446,9 +415,8 @@ def get_device_state(device_id: str) -> DeviceState:
 
 
 # ─────────────────────────────────────────
-# PI-COMPATIBLE PROCESSING LOGIC
+# PI-COMPATIBLE PACKET PROCESSING
 # ─────────────────────────────────────────
-
 
 def validate_sensor(hr: int, spo2: int, temp: float, wearing: bool) -> bool:
     if not wearing:
@@ -488,8 +456,16 @@ def quality_tier(score: int) -> str:
     return "invalid"
 
 
-def local_fusion(hr: int, spo2: int, temp: float, wearing: bool, imu_candidate: bool,
-                 hr_spike: bool, spo2_drop: bool, fault_flags: int) -> Dict[str, Any]:
+def local_fusion(
+    hr: int,
+    spo2: int,
+    temp: float,
+    wearing: bool,
+    imu_candidate: bool,
+    hr_spike: bool,
+    spo2_drop: bool,
+    fault_flags: int,
+) -> Dict[str, Any]:
     flags: List[str] = []
     danger = False
     warning = False
@@ -537,15 +513,7 @@ def local_fusion(hr: int, spo2: int, temp: float, wearing: bool, imu_candidate: 
     return {"status": status, "danger": danger, "warning": warning, "flags": flags or ["Normal"]}
 
 
-
-
 def reading_valid_for_display(snap: Dict[str, Any]) -> bool:
-    """Pi-compatible display validity rule.
-
-    A reading can update the values shown to the patient only when the watch is
-    worn and core vitals are non-zero. This prevents relay mode from replacing
-    a valid dashboard value with zeros while the watch is removed.
-    """
     try:
         return bool(
             snap.get("wearing") is True
@@ -567,7 +535,6 @@ def format_duration_sec(seconds: float) -> str:
 
 
 def apply_worn_time_and_display_fields(snap: Dict[str, Any], state: DeviceState) -> None:
-    """Mirror Raspberry Pi worn-time and cached display-value behavior."""
     now = time.time()
     day_key = snap.get("day_key") or utc_now_iso()[:10]
 
@@ -633,6 +600,7 @@ def apply_worn_time_and_display_fields(snap: Dict[str, Any], state: DeviceState)
     snap["worn_today_sec"] = int(state.worn_today_sec)
     snap["worn_today_label"] = format_duration_sec(state.worn_today_sec)
 
+
 def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
     vitals = payload.get("vitals") if isinstance(payload.get("vitals"), dict) else {}
     motion = payload.get("motion") if isinstance(payload.get("motion"), dict) else {}
@@ -643,10 +611,15 @@ def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "uid": str(payload.get("uid", "")).strip(),
         "device_id": str(payload.get("device_id", "")).strip(),
-        "esp_packet_id": str(payload.get("packet_id", payload.get("esp_packet_id", ""))).strip() or None,
+        "esp_packet_id": str(payload.get("esp_packet_id", payload.get("packet_id", ""))).strip() or None,
         "heart_rate": safe_get(vitals or payload, "heart_rate", safe_get(payload, "hr", 0), int),
         "spo2": safe_get(vitals or payload, "spo2", 0, int),
-        "temperature": safe_get(vitals or payload, "temperature", safe_get(vitals or payload, "temperature_c", safe_get(payload, "tempC", 0.0)), float),
+        "temperature": safe_get(
+            vitals or payload,
+            "temperature",
+            safe_get(vitals or payload, "temperature_c", safe_get(payload, "tempC", safe_get(payload, "temp", 0.0))),
+            float,
+        ),
         "wearing": wearing,
         "imu_candidate": bool(safe_get(motion or payload, "imu_candidate", safe_get(payload, "candidate", False))),
         "imu_peak_svm": safe_get(motion or payload, "peak_svm", safe_get(payload, "peakSVM", 0.0), float),
@@ -678,10 +651,16 @@ def build_snapshot(packet: Dict[str, Any], relay_device_id: str, state: DeviceSt
     timestamp = utc_now_iso()
     confidence = compute_confidence(state, packet["heart_rate"], packet["spo2"], packet["wearing"])
     fusion = local_fusion(
-        packet["heart_rate"], packet["spo2"], packet["temperature"], packet["wearing"],
-        packet["imu_candidate"], packet["hr_spike"], packet["spo2_drop"], packet["fault_flags"],
+        packet["heart_rate"],
+        packet["spo2"],
+        packet["temperature"],
+        packet["wearing"],
+        packet["imu_candidate"],
+        packet["hr_spike"],
+        packet["spo2_drop"],
+        packet["fault_flags"],
     )
-    pi_received_at_ms = int(time.time() * 1000)
+    render_received_at_ms = int(time.time() * 1000)
 
     return {
         "packet_id": str(uuid.uuid4()),
@@ -708,7 +687,7 @@ def build_snapshot(packet: Dict[str, Any], relay_device_id: str, state: DeviceSt
         "esp_packet_id": packet["esp_packet_id"],
         "esp_sent_at_ms": packet["esp_sent_at_ms"],
         "esp_sent_at_epoch_ms": packet["esp_sent_at_epoch_ms"],
-        "pi_received_at_ms": pi_received_at_ms,
+        "render_received_at_ms": render_received_at_ms,
         "esp_uptime_ms": packet["esp_uptime_ms"],
         "esp_boot_count": packet["esp_boot_count"],
         "wear_confidence": packet["wear_confidence"],
@@ -729,9 +708,6 @@ def build_snapshot(packet: Dict[str, Any], relay_device_id: str, state: DeviceSt
         "hr_trend": state.buf_hr.trend(),
         "spo2_trend": state.buf_spo2.trend(),
         "temp_trend": state.buf_temp.trend(),
-        "pi_online": False,
-        "pi_heartbeat": hb_monitor.last_heartbeat_time,
-        "pi_id": hb_monitor.last_pi_id,
         "fog_pipeline_ok": True,
         "cloud_connected": fs is not None,
         "connection_mode": "relay",
@@ -749,9 +725,9 @@ def build_snapshot(packet: Dict[str, Any], relay_device_id: str, state: DeviceSt
 # FIREBASE WRITES
 # ─────────────────────────────────────────
 
-
 def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
     base = rtdb.reference(f"live/{uid}/{device_id}")
+
     base.child("vitals").update({
         "heart_rate": snap["heart_rate"],
         "spo2": snap["spo2"],
@@ -776,7 +752,7 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "esp_packet_id": snap["esp_packet_id"],
         "esp_sent_at_ms": snap["esp_sent_at_ms"],
         "esp_sent_at_epoch_ms": snap["esp_sent_at_epoch_ms"],
-        "pi_received_at_ms": snap["pi_received_at_ms"],
+        "render_received_at_ms": snap["render_received_at_ms"],
         "esp_uptime_ms": snap["esp_uptime_ms"],
         "esp_boot_count": snap["esp_boot_count"],
         "wear_confidence": snap["wear_confidence"],
@@ -796,11 +772,8 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "updated_at": snap["timestamp"],
         "packet_id": snap["packet_id"],
     })
+
     base.child("status").update({
-        "pi_online": False,
-        "pi_last_seen": snap["pi_heartbeat"],
-        "pi_heartbeat": snap["pi_heartbeat"],
-        "pi_id": snap["pi_id"],
         "relay_active": True,
         "relay_source_id": snap["relay_source_id"],
         "connection_mode": "relay",
@@ -822,12 +795,14 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "operating_mode": "relay",
         **history_sync_snapshot(),
     })
+
     base.child("alerts").update({
         "active": bool(snap["danger"] or snap["warning"]),
         "latest_status": snap["status"],
         "latest_alert_type": snap["alert_flags_list"][0] if snap["alert_flags_list"] else None,
         "latest_alert_at": snap["timestamp"] if snap["alert_flags_list"] and snap["alert_flags_list"][0] != "Normal" else None,
     })
+
     base.child("device").update({
         "battery_pct": snap["battery_pct"],
         "power_mode": snap["power_mode"],
@@ -837,9 +812,9 @@ def write_live_snapshot(uid: str, device_id: str, snap: Dict[str, Any]) -> None:
         "schema_version": snap["schema_version"],
         "updated_at": snap["timestamp"],
     })
+
     base.child("system_health").update({
         "band_connected": True,
-        "pi_online": False,
         "firebase_reachable": fs is not None,
         "render_relay_alive": True,
         "relay_active": True,
@@ -854,32 +829,31 @@ def firestore_set_job(job_type: str, uid: str, device_id: str, payload: Dict[str
     if not fs:
         raise RuntimeError("Firestore client is not available")
 
+    device_doc = fs.collection("users").document(uid).collection("devices").document(device_id)
+
     if job_type == "reading":
         doc_id = str(payload.get("packet_id") or payload.get("esp_packet_id") or uuid.uuid4())
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("readings").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
-        # Optional alias for dashboards that expect vital_readings.
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("vital_readings").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("readings").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("vital_readings").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
         return
 
     if job_type == "alert":
         doc_id = str(payload.get("alert_id") or payload.get("packet_id") or uuid.uuid4())
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("alert_logs").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("alert_logs").document(doc_id).set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
         return
 
     if job_type == "relay_event":
         doc_id = str(payload.get("event_id") or uuid.uuid4())
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("relay_events").document(doc_id).set({**payload, "occurred_at": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("relay_events").document(doc_id).set({**payload, "occurred_at": firestore.SERVER_TIMESTAMP})
         return
 
     if job_type == "perf":
-        # Primary Schema v5 path used by the Flutter app/web dashboard.
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("performance_logs").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
-        # Compatibility with older Pi code that used perf_log.
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("perf_log").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("performance_logs").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("perf_log").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
         return
 
     if job_type == "audit":
-        fs.collection("users").document(uid).collection("devices").document(device_id).collection("audit_logs").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
+        device_doc.collection("audit_logs").document().set({**payload, "timestamp_server": firestore.SERVER_TIMESTAMP})
         return
 
     raise ValueError(f"Unknown Firestore job type: {job_type}")
@@ -899,6 +873,7 @@ def write_alert_log_if_needed(uid: str, device_id: str, snap: Dict[str, Any], st
         return
     if not state.deduplicator.should_write(flags):
         return
+
     enqueue_firestore_job("alert", uid, device_id, {
         "alert_id": snap["packet_id"],
         "alert_types": snap["alert_flags_list"],
@@ -919,29 +894,25 @@ def write_alert_log_if_needed(uid: str, device_id: str, snap: Dict[str, Any], st
 def write_relay_event_once(uid: str, device_id: str, relay_device_id: str, state: DeviceState) -> None:
     if state.relay_event_written:
         return
+
     event_id = str(uuid.uuid4())
     timestamp = utc_now_iso()
+
     enqueue_firestore_job("relay_event", uid, device_id, {
         "event_id": event_id,
-        "event_type": "FAILOVER_START",
+        "event_type": "RELAY_PACKET_RECEIVED",
         "iso_timestamp": timestamp,
         "day_key": timestamp[:10],
         "month_key": timestamp[:7],
         "relay_device_id": relay_device_id,
-        "trigger": "pi_unavailable_phone_relay_active",
-        "pi_last_seen": hb_monitor.last_heartbeat_time,
-        "details": f"Phone relay packet received. Pi heartbeat alive={hb_monitor.is_alive()} silent_for={hb_monitor.seconds_since():.1f}s",
+        "trigger": "phone_relay_packet_received",
+        "details": "Phone relay packet received and processed by Render relay backend.",
         "source_type": SOURCE_TYPE_RELAY,
         "source_id": RELAY_NODE_ID,
         "source_path": SOURCE_PATH_RELAY,
         "processed_by": PROCESSED_BY_NAME,
         "relay_source_type": SOURCE_TYPE_RELAY,
         "relay_source_id": relay_device_id,
-        "heartbeat_last_time": hb_monitor.last_heartbeat_time,
-        "heartbeat_alive": hb_monitor.is_alive(),
-        "heartbeat_seconds_since": round(hb_monitor.seconds_since(), 2),
-        "heartbeat_timeout_sec": HEARTBEAT_TIMEOUT_SEC,
-        "pi_heartbeat_interval": PI_HEARTBEAT_INTERVAL_SEC,
         "schema_version": SCHEMA_VERSION,
     })
     state.relay_event_written = True
@@ -960,11 +931,19 @@ def avg(values: Deque[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
-def write_performance_metrics(uid: str, device_id: str, snap: Dict[str, Any], state: DeviceState,
-                              render_processing_ms: float, firebase_write_ms: float,
-                              phone_to_render_ms: Optional[float], total_pipeline_ms: Optional[float]) -> None:
+def write_performance_metrics(
+    uid: str,
+    device_id: str,
+    snap: Dict[str, Any],
+    state: DeviceState,
+    render_processing_ms: float,
+    firebase_write_ms: float,
+    phone_to_render_ms: Optional[float],
+    total_pipeline_ms: Optional[float],
+) -> None:
     if phone_to_render_ms is not None:
         state.lat_phone_to_render.append(phone_to_render_ms)
+
     state.lat_render_processing.append(render_processing_ms)
     state.lat_firebase.append(firebase_write_ms)
     state.lat_total.append(total_pipeline_ms if total_pipeline_ms is not None else render_processing_ms + firebase_write_ms)
@@ -987,6 +966,7 @@ def write_performance_metrics(uid: str, device_id: str, snap: Dict[str, Any], st
         "time_synced": snap.get("time_synced"),
         "updated_at": utc_now_iso(),
     }
+
     try:
         rtdb.reference(f"live/{uid}/{device_id}/performance").update(sample)
     except Exception as exc:
@@ -1002,29 +982,47 @@ def write_performance_metrics(uid: str, device_id: str, snap: Dict[str, Any], st
 # CORE PROCESSOR
 # ─────────────────────────────────────────
 
-
 def process_packet(payload: Dict[str, Any], relay_device_id: str) -> Dict[str, Any]:
     request_start_ms = int(time.time() * 1000)
     packet = extract_packet(payload)
+
     uid = packet["uid"]
     device_id = packet["device_id"]
 
     if not uid or not device_id:
         return {"ok": False, "error": "Missing uid or device_id"}
+
     if not device_id.startswith("rafeeq-watch-"):
         return {"ok": False, "error": f"Unexpected device_id format: {device_id}"}
 
     state = get_device_state(device_id)
 
     if state.duplicate_packet(packet["esp_packet_id"]):
-        return {"ok": True, "skipped": True, "reason": "duplicate", "esp_packet_id": packet["esp_packet_id"]}
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "duplicate",
+            "esp_packet_id": packet["esp_packet_id"],
+            "connection_mode": "relay",
+        }
 
     if time.time() - state.last_upload_ts < UPLOAD_COOLDOWN_SEC:
-        return {"ok": True, "skipped": True, "reason": "cooldown"}
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "cooldown",
+            "connection_mode": "relay",
+        }
 
     if not validate_sensor(packet["heart_rate"], packet["spo2"], packet["temperature"], packet["wearing"]):
         log.warning("[VALIDATION] Rejected hr=%s spo2=%s temp=%s", packet["heart_rate"], packet["spo2"], packet["temperature"])
-        return {"ok": False, "error": "Sensor validation failed", "hr": packet["heart_rate"], "spo2": packet["spo2"]}
+        return {
+            "ok": False,
+            "error": "Sensor validation failed",
+            "hr": packet["heart_rate"],
+            "spo2": packet["spo2"],
+            "connection_mode": "relay",
+        }
 
     if packet["wearing"]:
         if packet["heart_rate"]:
@@ -1035,6 +1033,7 @@ def process_packet(payload: Dict[str, Any], relay_device_id: str) -> Dict[str, A
             state.buf_temp.push(packet["temperature"])
 
     write_relay_event_once(uid, device_id, relay_device_id, state)
+
     snap = build_snapshot(packet, relay_device_id, state)
     apply_worn_time_and_display_fields(snap, state)
 
@@ -1049,21 +1048,29 @@ def process_packet(payload: Dict[str, Any], relay_device_id: str) -> Dict[str, A
 
     try:
         write_start_ms = int(time.time() * 1000)
+
         write_live_snapshot(uid, device_id, snap)
         write_firestore_history(uid, device_id, snap, state)
         write_alert_log_if_needed(uid, device_id, snap, state)
+
         write_done_ms = int(time.time() * 1000)
 
         write_performance_metrics(
-            uid, device_id, snap, state,
+            uid,
+            device_id,
+            snap,
+            state,
             render_processing_ms=max(0, write_start_ms - request_start_ms),
             firebase_write_ms=max(0, write_done_ms - write_start_ms),
             phone_to_render_ms=phone_to_render_ms,
             total_pipeline_ms=esp_to_cloud_total_ms,
         )
+
         state.daily_readings += 1
         state.last_upload_ts = time.time()
+
         log.info("[UPLOAD] relay uid=%s device=%s status=%s flags=%s", uid, device_id, snap["status"], snap["alert_flags_str"])
+
         return {
             "ok": True,
             "packet_id": snap["packet_id"],
@@ -1071,11 +1078,13 @@ def process_packet(payload: Dict[str, Any], relay_device_id: str) -> Dict[str, A
             "alert_flags": snap["alert_flags_str"],
             "wearing": snap["wearing"],
             "connection_mode": "relay",
+            "relay_accepted": True,
             "history_sync": history_sync_snapshot(),
         }
+
     except Exception as exc:
         log.exception("[UPLOAD] RTDB live write failed: %s", exc)
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": str(exc), "connection_mode": "relay"}
 
 
 # ─────────────────────────────────────────
@@ -1088,12 +1097,15 @@ shutdown_event = threading.Event()
 def queue_retry_loop() -> None:
     while not shutdown_event.is_set():
         shutdown_event.wait(FIRESTORE_WORKER_INTERVAL_SEC)
+
         if shutdown_event.is_set():
             break
+
         if not fs:
             continue
 
         jobs = local_queue.next_batch(FIRESTORE_WORKER_BATCH_SIZE)
+
         if not jobs:
             local_queue.purge_delivered()
             update_history_sync_state("ok")
@@ -1128,7 +1140,12 @@ def _check_api_key() -> Optional[str]:
 
 
 def _relay_device_id_from_request(data: Dict[str, Any]) -> str:
-    return request.headers.get("X-Relay-Device-Id") or str(data.get("relay_device_id", DEFAULT_RELAY_DEVICE_ID))
+    return (
+        request.headers.get("X-Relay-Device-Id")
+        or str(data.get("relay_source_id", ""))
+        or str(data.get("relay_device_id", ""))
+        or DEFAULT_RELAY_DEVICE_ID
+    )
 
 
 @app.route("/health", methods=["GET"])
@@ -1137,22 +1154,11 @@ def health():
         "status": "ok",
         "firebase": fs is not None,
         "server": PROCESSED_BY_NAME,
+        "role": "render_relay_backend",
         "schema_version": SCHEMA_VERSION,
         "connection_mode_written": "relay",
-        "pi_alive": hb_monitor.is_alive(),
-        "pi_seconds_since": None if math.isinf(hb_monitor.seconds_since()) else round(hb_monitor.seconds_since(), 1),
         "history_sync": history_sync_snapshot(),
     })
-
-
-@app.route("/pi/heartbeat", methods=["POST"])
-def pi_heartbeat():
-    err = _check_api_key()
-    if err:
-        return jsonify({"ok": False, "error": err}), 401
-    data = request.get_json(silent=True) if request.is_json else {}
-    hb_monitor.record(data if isinstance(data, dict) else None)
-    return jsonify({"ok": True, "pi_alive": True})
 
 
 @app.route("/relay/packet", methods=["POST"])
@@ -1160,11 +1166,14 @@ def relay_packet():
     err = _check_api_key()
     if err:
         return jsonify({"ok": False, "error": err}), 401
+
     if not request.is_json:
         return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
+
     data = request.get_json(silent=True)
     if not data or not isinstance(data, dict):
         return jsonify({"ok": False, "error": "Invalid or empty JSON body"}), 400
+
     result = process_packet(data, _relay_device_id_from_request(data))
     return jsonify(result), 200 if result.get("ok") else 422
 
@@ -1173,14 +1182,22 @@ def relay_packet():
 def relay_ingest():
     err = _check_api_key()
     if err:
-        return jsonify({"ok": False, "error": err}), 401
+        return jsonify({"success": False, "error": err}), 401
+
     if not request.is_json:
         return jsonify({"success": False, "error": "Content-Type must be application/json"}), 400
+
     data = request.get_json(silent=True)
     if not data or not isinstance(data, dict):
         return jsonify({"success": False, "error": "Invalid or empty JSON body"}), 400
+
     result = process_packet(data, _relay_device_id_from_request(data))
-    return jsonify({"success": result.get("ok", False), "received": data, "detail": result}), 200
+    return jsonify({
+        "success": result.get("ok", False),
+        "ok": result.get("ok", False),
+        "received": True,
+        "detail": result,
+    }), 200 if result.get("ok") else 422
 
 
 @app.route("/relay/batch", methods=["POST"])
@@ -1188,25 +1205,41 @@ def relay_batch():
     err = _check_api_key()
     if err:
         return jsonify({"ok": False, "error": err}), 401
+
     if not request.is_json:
         return jsonify({"ok": False, "error": "Content-Type must be application/json"}), 400
+
     body = request.get_json(silent=True)
     if not body or not isinstance(body, dict):
         return jsonify({"ok": False, "error": "Invalid JSON"}), 400
+
     packets = body.get("packets", [])
     if not isinstance(packets, list) or not packets:
         return jsonify({"ok": False, "error": "packets array is empty or missing"}), 400
+
     relay_device_id = _relay_device_id_from_request(body)
     results = []
+
     for i, pkt in enumerate(packets):
         if not isinstance(pkt, dict):
             results.append({"index": i, "ok": False, "error": "not a dict"})
             continue
+
         r = process_packet(pkt, relay_device_id)
         r["index"] = i
         results.append(r)
+
     ok_count = sum(1 for r in results if r.get("ok"))
-    return jsonify({"ok": True, "processed": len(results), "ok_count": ok_count, "fail_count": len(results) - ok_count, "results": results})
+
+    return jsonify({
+        "ok": True,
+        "success": True,
+        "received": True,
+        "processed": len(results),
+        "ok_count": ok_count,
+        "fail_count": len(results) - ok_count,
+        "results": results,
+    })
 
 
 @app.route("/relay/reset_session/<device_id>", methods=["POST"])
@@ -1214,10 +1247,14 @@ def reset_relay_session(device_id: str):
     err = _check_api_key()
     if err:
         return jsonify({"ok": False, "error": err}), 401
+
     with _device_states_lock:
         if device_id in _device_states:
             _device_states[device_id].relay_event_written = False
-    return jsonify({"ok": True, "device_id": device_id})
+            _device_states[device_id].seen_packet_ids.clear()
+            _device_states[device_id].last_upload_ts = 0.0
+
+    return jsonify({"ok": True, "success": True, "device_id": device_id})
 
 
 # ─────────────────────────────────────────
@@ -1225,7 +1262,12 @@ def reset_relay_session(device_id: str):
 # ─────────────────────────────────────────
 
 init_firebase()
-worker_thread = threading.Thread(target=queue_retry_loop, name="firestore_queue_worker", daemon=True)
+
+worker_thread = threading.Thread(
+    target=queue_retry_loop,
+    name="firestore_queue_worker",
+    daemon=True,
+)
 worker_thread.start()
 
 log.info("[SYSTEM] Rafeeq Render relay server ready")
