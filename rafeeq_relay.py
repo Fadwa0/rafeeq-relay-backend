@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RAFEEQ — Render Cloud Relay Server v5.3
+RAFEEQ — Render Cloud Relay Server v5.5 QoS/ACK Mode-Aligned
 Role: fallback relay pipeline when Raspberry Pi fog node is offline.
 
 Flow:
@@ -102,6 +102,35 @@ def parse_bool(value: Any, default: bool = True) -> bool:
     return default
 
 
+def build_worn_time_alias_fields(worn_today_sec_value: Any) -> Dict[str, Any]:
+    """Return the same wearing-time aliases written by the Raspberry Pi.
+
+    The relay tracks today's worn seconds, so rolling-24h aliases mirror today's
+    counter unless a future rolling tracker is added.
+    """
+    try:
+        sec = int(float(worn_today_sec_value or 0))
+    except Exception:
+        sec = 0
+    sec = max(0, sec)
+    ms = sec * 1000
+    pct = round((sec / 86400.0) * 100.0, 2)
+    return {
+        "worn_today_sec": sec,
+        "wearing_today_sec": sec,
+        "worn_today_seconds": sec,
+        "wearing_today_seconds": sec,
+        "worn_24h_sec": sec,
+        "wearing_24h_sec": sec,
+        "worn_last_24h_sec": sec,
+        "wearing_last_24h_sec": sec,
+        "worn_today_ms": ms,
+        "wearing_today_ms": ms,
+        "worn_today_pct": pct,
+        "wearing_today_percent": pct,
+    }
+
+
 def ensure_parent_dir(path: str) -> None:
     directory = os.path.dirname(path)
     if directory:
@@ -112,12 +141,14 @@ def ensure_parent_dir(path: str) -> None:
 # CONFIG
 # ─────────────────────────────────────────
 
-SCHEMA_VERSION = "5.0"
+SCHEMA_VERSION = "8.0"
+ACCEPTED_SCHEMA_PREFIXES = ("5", "7", "8")
+SUPPORTED_SCHEMA_MAJOR = {"5", "7", "8"}
 SOURCE_TYPE_RELAY = "render_relay"
 SOURCE_PATH_RELAY = "relay"
 PROCESSED_BY_NAME = "Render Relay Backend"
 RELAY_NODE_ID = os.getenv("RAFEEQ_RELAY_NODE_ID", "render-relay-node-01")
-BACKEND_VERSION = os.getenv("RAFEEQ_BACKEND_VERSION", "5.3.0")
+BACKEND_VERSION = os.getenv("RAFEEQ_BACKEND_VERSION", "5.5.0")
 
 UPLOAD_COOLDOWN_SEC = env_float("RAFEEQ_UPLOAD_COOLDOWN_SEC", 2.0)
 ROLLING_WINDOW_SIZE = env_int("RAFEEQ_ROLLING_WINDOW_SIZE", 10)
@@ -139,6 +170,9 @@ ALLOW_INSECURE_DEV = os.getenv("RAFEEQ_ALLOW_INSECURE_DEV", "false").strip().low
 # Guard: write mode_history at most once per N seconds per device to avoid spam
 MODE_HISTORY_COOLDOWN_SEC = env_float("RAFEEQ_MODE_HISTORY_COOLDOWN_SEC", 30.0)
 AUDIT_LOG_COOLDOWN_SEC = env_float("RAFEEQ_AUDIT_LOG_COOLDOWN_SEC", 60.0)
+# Live lane safety: queued continuity packets may update RTDB live only when the
+# existing live reading is absent/stale. Fresh live packets never wait for backfill.
+LIVE_STALE_THRESHOLD_SEC = env_float("RAFEEQ_LIVE_STALE_THRESHOLD_SEC", 20.0)
 
 fs: Any = None  # Firestore client
 
@@ -386,6 +420,38 @@ def history_sync_snapshot() -> Dict[str, Any]:
     }
 
 
+
+def build_delivery_ack(
+    packet_id: Optional[str],
+    device_id: Optional[str],
+    *,
+    accepted: bool,
+    duplicate: bool = False,
+    live_written: bool = False,
+    connection_mode_written: Optional[str] = None,
+    protection_reason: Optional[str] = None,
+    ack_level: str = "render_received",
+) -> Dict[str, Any]:
+    """Build the explicit cloud-delivery acknowledgement consumed by the Flutter app.
+
+    The app may delete a local queued packet only when accepted=true or duplicate=true.
+    Render does not decrypt ESP8 wrappers; it receives normalized packets from Flutter.
+    """
+    return {
+        "accepted": bool(accepted),
+        "duplicate": bool(duplicate),
+        "delete_from_phone_queue": bool(accepted or duplicate),
+        "packet_id": packet_id,
+        "device_id": device_id,
+        "ack_level": ack_level,
+        "live_written": bool(live_written),
+        "connection_mode_written": connection_mode_written,
+        "protection_reason": protection_reason,
+        "acknowledged_at": utc_now_iso(),
+        "backend_version": BACKEND_VERSION,
+    }
+
+
 def enqueue_job(job_type: str, uid: str, device_id: str, payload: Dict[str, Any]) -> None:
     if not uid or not device_id:
         return
@@ -473,9 +539,13 @@ def validate_relay_request(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not pid:
         return {"ok": False, "error": "missing_packet_id", "message": "packet_id or esp_packet_id is required"}
 
-    sv = str(data.get("schema_version", "5.0"))
-    if not sv.startswith("5"):
-        return {"ok": False, "error": "invalid_schema_version", "message": f"schema_version must be 5.x, got {sv}"}
+    sv = str(data.get("schema_version", SCHEMA_VERSION))
+    if sv.split(".")[0] not in SUPPORTED_SCHEMA_MAJOR:
+        return {
+            "ok": False,
+            "error": "invalid_schema_version",
+            "message": f"schema_version must be compatible with 5.x, 7.x, or 8.x, got {sv}",
+        }
 
     hr = safe_get(vitals or data, "heart_rate", safe_get(data, "hr", None), int)
     spo2 = safe_get(vitals or data, "spo2", None, int)
@@ -505,6 +575,184 @@ def validate_sensor(hr: int, spo2: int, temp: float, wearing: bool) -> bool:
     return True
 
 
+def normalize_schema_version(value: Any) -> str:
+    """Keep payload schema version when supported; default to backend schema otherwise."""
+    sv = str(value or SCHEMA_VERSION).strip()
+    return sv if sv.split(".")[0] in SUPPORTED_SCHEMA_MAJOR else SCHEMA_VERSION
+
+
+def normalize_blood_pressure(value: Any) -> str:
+    """ESP v8 sends blood_pressure as a string. Keep it string, but make placeholders patient-safe."""
+    bp = str(value if value is not None else "").strip()
+    if not bp or bp in {"0", "0/0", "0 / 0", "--"}:
+        return "Not available"
+    return bp
+
+
+def normalize_glucose(value: Any) -> Any:
+    """Glucose stays numeric when real; placeholder 0 remains numeric for schema compatibility."""
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return float(value)
+        except Exception:
+            return 0
+
+
+def normalize_battery_pct(value: Any) -> Optional[int]:
+    """Battery -1 from ESP means no battery sensor is wired."""
+    try:
+        v = int(value)
+        return v
+    except Exception:
+        return None
+
+
+def app_says_pi_unavailable(payload: Dict[str, Any]) -> bool:
+    """Single mode-decision helper shared by live relay protection rules."""
+    return (
+        payload.get("app_pi_online") is False
+        or payload.get("pi_online") is False
+        or payload.get("pi_available") is False
+        or payload.get("pi_stale") is True
+        or payload.get("force_relay") is True
+        or payload.get("relay_active") is True
+        or str(payload.get("connection_mode", "")).lower() == "relay"
+    )
+
+
+
+
+# ─────────────────────────────────────────
+# LIVE-LANE / BACKFILL ROUTING HELPERS
+# ─────────────────────────────────────────
+
+def packet_epoch_ms(packet: Dict[str, Any], fallback_ms: Optional[int] = None) -> Optional[int]:
+    """Best-effort packet event time, used only to prevent old queue data overwriting live."""
+    for key in ("esp_sent_at_epoch_ms", "sent_at_epoch_ms", "phone_sent_at_epoch_ms"):
+        value = packet.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            pass
+    return fallback_ms
+
+
+def iso_to_epoch_ms(value: Any) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def current_live_epoch_ms(current_vitals: Dict[str, Any]) -> Optional[int]:
+    for key in ("esp_sent_at_epoch_ms", "packet_epoch_ms", "source_epoch_ms"):
+        value = current_vitals.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            pass
+    return iso_to_epoch_ms(
+        current_vitals.get("display_updated_at")
+        or current_vitals.get("updated_at")
+        or current_vitals.get("timestamp")
+    )
+
+
+def classify_packet_lane(packet: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    """Classify packet routing without changing mode ownership.
+
+    live:
+      New/latest packet from phone relay. It may update RTDB live immediately.
+    continuity:
+      Newest locally available queued packet used to keep the UI moving only when
+      there is no fresher live reading.
+    history:
+      Old/backfill packet. It must go to Firestore history only and never overwrite RTDB live.
+    """
+    is_queued = bool(packet.get("is_queued") or parse_bool(payload.get("is_queued", False), False))
+    latest_live = bool(packet.get("latest_live") or parse_bool(payload.get("latest_live", False), False))
+    continuity = bool(
+        payload.get("continuity_sample") is True
+        or payload.get("is_continuity_sample") is True
+        or packet.get("offline_type_hint") in {"continuity", "latest_local", "last_received"}
+        or str(payload.get("offline_type_hint", "")).lower() in {"continuity", "latest_local", "last_received"}
+    )
+
+    if is_queued and not latest_live and not continuity:
+        return "history"
+    if is_queued and continuity:
+        return "continuity"
+    if latest_live:
+        return "live"
+    # Backward compatibility: older app builds send relay packets without latest_live.
+    return "live"
+
+
+def live_is_absent_or_stale(current_vitals: Dict[str, Any], packet: Dict[str, Any], now_ms: int) -> Tuple[bool, str]:
+    current_ms = current_live_epoch_ms(current_vitals)
+    incoming_ms = packet_epoch_ms(packet, fallback_ms=now_ms)
+
+    if not current_vitals or current_ms is None:
+        return True, "no_current_live_timestamp"
+
+    # Never allow an older continuity/backfill sample to overwrite a newer live sample.
+    if incoming_ms is not None and incoming_ms < current_ms:
+        return False, "incoming_packet_older_than_current_live"
+
+    age_sec = max(0.0, (now_ms - current_ms) / 1000.0)
+    if age_sec >= LIVE_STALE_THRESHOLD_SEC:
+        return True, "current_live_stale"
+
+    return False, "current_live_fresh"
+
+
+def should_write_live_for_lane(
+    current_status: Dict[str, Any],
+    packet: Dict[str, Any],
+    payload: Dict[str, Any],
+    current_vitals: Optional[Dict[str, Any]] = None,
+    now_ms: Optional[int] = None,
+) -> Tuple[bool, str, str]:
+    """Return (allowed, lane, reason).
+
+    This is the core live-lane rule:
+    - New live packets do not wait for queued backfill.
+    - Old queued packets are history-only.
+    - Continuity queued packets may update RTDB live only when current live is absent/stale.
+    - Pi primary and pi_handover ownership are always protected.
+    """
+    lane = classify_packet_lane(packet, payload)
+
+    if is_pi_handover_active(current_status):
+        return False, lane, "pi_handover_active"
+
+    if current_status.get("connection_mode") == "primary" and not app_says_pi_unavailable(payload):
+        return False, lane, "primary_protected"
+
+    if lane == "history":
+        return False, lane, "queued_history_only"
+
+    if lane == "continuity":
+        safe, reason = live_is_absent_or_stale(current_vitals or {}, packet, now_ms or int(time.time() * 1000))
+        return safe, lane, reason
+
+    return True, lane, "latest_live_lane"
+
+
 def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
     vitals = payload.get("vitals") if isinstance(payload.get("vitals"), dict) else {}
     motion = payload.get("motion") if isinstance(payload.get("motion"), dict) else {}
@@ -522,7 +770,7 @@ def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
         "packet_id": packet_id,
         "esp_packet_id": esp_packet_id,
         "seq": safe_get(payload, "seq", None, int),
-        "schema_version": str(payload.get("schema_version", SCHEMA_VERSION)),
+        "schema_version": normalize_schema_version(payload.get("schema_version", SCHEMA_VERSION)),
         "heart_rate": safe_get(vitals or payload, "heart_rate", safe_get(payload, "hr", 0), int),
         "spo2": safe_get(vitals or payload, "spo2", 0, int),
         "temperature": safe_get(
@@ -530,8 +778,8 @@ def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
             safe_get(vitals or payload, "temperature_c", safe_get(payload, "tempC", safe_get(payload, "temp", 0.0))),
             float,
         ),
-        "blood_pressure": str(payload.get("blood_pressure", vitals.get("blood_pressure", "0/0"))),
-        "glucose": safe_get(vitals or payload, "glucose", 0, int),
+        "blood_pressure": normalize_blood_pressure(payload.get("blood_pressure", vitals.get("blood_pressure", "0/0"))),
+        "glucose": normalize_glucose(safe_get(vitals or payload, "glucose", 0)),
         "wearing": wearing,
         "confidence_score": safe_get(payload, "confidence_score", safe_get(vitals, "confidence_score", None), int),
         "wear_confidence": str(payload.get("wear_confidence", vitals.get("wear_confidence", "unknown"))),
@@ -546,7 +794,7 @@ def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
         "esp_sent_at_epoch_ms": safe_get(payload, "sent_at_epoch_ms", safe_get(payload, "esp_sent_at_epoch_ms", None), int),
         "esp_uptime_ms": safe_get(payload, "esp_uptime_ms", None, int),
         "esp_boot_count": safe_get(payload, "esp_boot_count", device.get("esp_boot_count"), int),
-        "battery_pct": safe_get(payload, "battery_pct", device.get("battery_pct"), int),
+        "battery_pct": normalize_battery_pct(payload.get("battery_pct", device.get("battery_pct"))),
         "power_mode": str(payload.get("power_mode", device.get("power_mode", "POWER_NORMAL"))),
         "charging": parse_bool(payload.get("charging", device.get("charging", False)), False),
         "fault_flags": safe_get(payload, "fault_flags", device.get("fault_flags", 0), int),
@@ -558,6 +806,18 @@ def extract_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
         "transport_mode": str(payload.get("transport_mode", "BLE_RELAY")),
         "is_queued": parse_bool(payload.get("is_queued", False), False),
         "latest_live": parse_bool(payload.get("latest_live", False), False),
+        "buffered": parse_bool(payload.get("buffered", False), False),
+        "buffer_count": safe_get(payload, "buffer_count", 0, int),
+        "retry_count": safe_get(payload, "retry_count", 0, int),
+        "offline_type_hint": str(payload.get("offline_type_hint", "")),
+        "phone_connected": parse_bool(payload.get("phone_connected", True), True),
+        "relay_streaming": parse_bool(payload.get("relay_streaming", True), True),
+        "ack_pending": parse_bool(payload.get("ack_pending", False), False),
+        "free_heap": safe_get(payload, "free_heap", device.get("free_heap"), int),
+        "pi_ble_rssi": safe_get(payload, "pi_ble_rssi", payload.get("ble_rssi"), int),
+        "hr_quality": safe_get(payload, "hr_quality", None, int),
+        "hr_stable": parse_bool(payload.get("hr_stable", None), True),
+        "sample_timestamp": payload.get("sample_timestamp"),
         "firmware_version": str(payload.get("firmware_version", device.get("firmware_version", ""))),
     }
 
@@ -693,6 +953,8 @@ def compute_display_fields(packet: Dict[str, Any], state: DeviceState) -> Dict[s
             "display_glucose": packet.get("glucose", 0),
             "display_updated_at": utc_now_iso(),
             "last_valid_reading": dict(state.last_valid_reading),
+            "wearing_today_sec": int(state.worn_today_sec),
+            "wearing_today_label": format_duration_sec(state.worn_today_sec),
         }
 
     elif not wearing:
@@ -715,6 +977,8 @@ def compute_display_fields(packet: Dict[str, Any], state: DeviceState) -> Dict[s
             "display_glucose": display.get("glucose"),
             "display_updated_at": display.get("updated_at"),
             "last_valid_reading": dict(state.last_valid_reading),
+            "wearing_today_sec": int(state.worn_today_sec),
+            "wearing_today_label": format_duration_sec(state.worn_today_sec),
         }
 
     else:
@@ -729,6 +993,8 @@ def compute_display_fields(packet: Dict[str, Any], state: DeviceState) -> Dict[s
             "display_glucose": lvr.get("glucose"),
             "display_updated_at": lvr.get("updated_at"),
             "last_valid_reading": dict(lvr),
+            "wearing_today_sec": int(state.worn_today_sec),
+            "wearing_today_label": format_duration_sec(state.worn_today_sec),
         }
 
 
@@ -746,6 +1012,17 @@ def read_current_firebase_status(uid: str, device_id: str) -> Dict[str, Any]:
         log.warning("[STATUS_READ] Failed to read current status: %s", exc)
         return {}
 
+
+
+def read_current_firebase_vitals(uid: str, device_id: str) -> Dict[str, Any]:
+    """Read current live vitals from RTDB. Used only to prevent old backfill overwrites."""
+    try:
+        ref = rtdb.reference(f"live/{uid}/{device_id}/vitals")
+        val = ref.get()
+        return val if isinstance(val, dict) else {}
+    except Exception as exc:
+        log.warning("[VITALS_READ] Failed to read current vitals: %s", exc)
+        return {}
 
 def is_pi_handover_active(status: Dict[str, Any]) -> bool:
     return (
@@ -771,14 +1048,13 @@ def should_render_write_relay(current_status: Dict[str, Any], packet: Dict[str, 
     if is_pi_handover_active(current_status):
         return False
 
+    # Only a true live relay packet may change connection_mode to relay.
+    # Queued history and continuity samples must never create mode thrashing.
+    if classify_packet_lane(packet, payload) != "live":
+        return False
+
     if current_status.get("connection_mode") == "primary":
-        app_says_pi_offline = (
-            payload.get("app_pi_online") is False
-            or payload.get("pi_online") is False
-            or payload.get("force_relay") is True
-            or payload.get("relay_active") is True
-        )
-        return app_says_pi_offline and not packet.get("is_queued")
+        return app_says_pi_unavailable(payload) and not packet.get("is_queued")
 
     return True
 
@@ -798,13 +1074,7 @@ def should_write_live_rtdb(current_status: Dict[str, Any], packet: Dict[str, Any
         return False
 
     if current_status.get("connection_mode") == "primary":
-        app_says_pi_offline = (
-            payload.get("app_pi_online") is False
-            or payload.get("pi_online") is False
-            or payload.get("force_relay") is True
-            or payload.get("relay_active") is True
-        )
-        return bool(payload.get("latest_live") is True and app_says_pi_offline)
+        return bool(payload.get("latest_live") is True and app_says_pi_unavailable(payload))
 
     return True
 
@@ -819,12 +1089,19 @@ def write_vitals_branch(uid: str, device_id: str, packet: Dict[str, Any],
     """Write only vitals-relevant fields to live/{uid}/{device_id}/vitals."""
     ref = rtdb.reference(f"live/{uid}/{device_id}/vitals")
     ref.update({
-        # Raw vitals
-        "heart_rate": packet["heart_rate"],
-        "spo2": packet["spo2"],
-        "temperature": packet["temperature"],
-        "blood_pressure": packet.get("blood_pressure", "0/0"),
-        "glucose": packet.get("glucose", 0),
+        # Official UI-facing vitals prefer display values. During relay/fallback,
+        # display_* carries the last valid reading when the watch is not worn.
+        # Raw packet values are preserved separately for diagnostics.
+        "heart_rate": display.get("display_heart_rate") if display.get("display_heart_rate") is not None else packet["heart_rate"],
+        "spo2": display.get("display_spo2") if display.get("display_spo2") is not None else packet["spo2"],
+        "temperature": display.get("display_temperature") if display.get("display_temperature") is not None else packet["temperature"],
+        "blood_pressure": display.get("display_blood_pressure") if display.get("display_blood_pressure") is not None else packet.get("blood_pressure", "0/0"),
+        "glucose": display.get("display_glucose") if display.get("display_glucose") is not None else packet.get("glucose", 0),
+        "raw_heart_rate": packet["heart_rate"],
+        "raw_spo2": packet["spo2"],
+        "raw_temperature": packet["temperature"],
+        "raw_blood_pressure": packet.get("blood_pressure", "0/0"),
+        "raw_glucose": packet.get("glucose", 0),
         # Display vitals (no zeros if invalid)
         "display_heart_rate": display.get("display_heart_rate"),
         "display_spo2": display.get("display_spo2"),
@@ -836,12 +1113,22 @@ def write_vitals_branch(uid: str, device_id: str, packet: Dict[str, Any],
         "reading_valid": display.get("reading_valid", False),
         "reading_status_label": display.get("reading_status_label", "Waiting for valid reading"),
         "last_valid_reading": display.get("last_valid_reading", {}),
+        **build_worn_time_alias_fields(display.get("wearing_today_sec", 0)),
+        "wearing_today_label": display.get("wearing_today_label", "0m"),
+        "worn_today_label": display.get("wearing_today_label", "0m"),
         # Quality
         "confidence_score": confidence,
         "quality_tier": quality,
         # Identifiers
         "packet_id": packet_id,
         "esp_packet_id": packet.get("esp_packet_id"),
+        # Live-lane metadata used to prevent old backfill from replacing newer live data.
+        "esp_sent_at_epoch_ms": packet.get("esp_sent_at_epoch_ms"),
+        "phone_sent_at_epoch_ms": packet.get("phone_sent_at_epoch_ms"),
+        "packet_epoch_ms": packet_epoch_ms(packet),
+        "live_lane_role": packet.get("_live_lane_role"),
+        "continuity_sample": bool(packet.get("_continuity_sample", False)),
+        "is_queued": bool(packet.get("is_queued", False)),
         # Timestamps
         "updated_at": timestamp,
     })
@@ -849,8 +1136,21 @@ def write_vitals_branch(uid: str, device_id: str, packet: Dict[str, Any],
 
 def write_status_branch(uid: str, device_id: str, timestamp: str,
                          connection_mode: str, request_id: str,
-                         transport_mode: str = "BLE_PHONE_RELAY") -> None:
-    """Write relay status fields. Caller must check Pi handover protection first."""
+                         transport_mode: str = "BLE_PHONE_RELAY",
+                         schema_version: str = SCHEMA_VERSION,
+                         packet: Optional[Dict[str, Any]] = None,
+                         display: Optional[Dict[str, Any]] = None) -> None:
+    """Write Render-owned relay status fields only.
+
+    Ownership rule:
+    - Render may set connection_mode="relay" when the phone relay is active.
+    - Render may mark pi_online=false because the app is explicitly reporting Pi unavailable.
+    - Render must NOT write live/{uid}/{device_id}/system_health; that branch remains Pi-owned.
+    - Render must NOT set primary or pi_handover recovery.
+    """
+    packet = packet or {}
+    display = display or {}
+    wearing_sec = display.get("wearing_today_sec", 0)
     ref = rtdb.reference(f"live/{uid}/{device_id}/status")
     ref.update({
         "connection_mode": connection_mode,
@@ -866,15 +1166,21 @@ def write_status_branch(uid: str, device_id: str, timestamp: str,
         "source_id": RELAY_NODE_ID,
         "transport_mode": transport_mode,
         "processed_by": PROCESSED_BY_NAME,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         # Render-specific metadata
         "render_last_seen": timestamp,
         "render_request_id": request_id,
         "render_backend_version": BACKEND_VERSION,
+        "operating_mode": connection_mode,
+        "esp_free_heap": packet.get("free_heap"),
+        "pi_ble_rssi": packet.get("pi_ble_rssi"),
+        **build_worn_time_alias_fields(wearing_sec),
+        "wearing_today_label": display.get("wearing_today_label", "0m"),
+        "worn_today_label": display.get("wearing_today_label", "0m"),
     })
 
 
-def write_device_branch(uid: str, device_id: str, packet: Dict[str, Any], timestamp: str) -> None:
+def write_device_branch(uid: str, device_id: str, packet: Dict[str, Any], timestamp: str, display: Optional[Dict[str, Any]] = None) -> None:
     """Write device hardware fields to live/{uid}/{device_id}/device."""
     ref = rtdb.reference(f"live/{uid}/{device_id}/device")
     update: Dict[str, Any] = {
@@ -892,8 +1198,22 @@ def write_device_branch(uid: str, device_id: str, packet: Dict[str, Any], timest
         "esp_uptime_ms": packet.get("esp_uptime_ms"),
         "esp_boot_count": packet.get("esp_boot_count"),
         "firmware_version": packet.get("firmware_version"),
+        "free_heap": packet.get("free_heap"),
+        "esp_free_heap": packet.get("free_heap"),
+        "pi_ble_rssi": packet.get("pi_ble_rssi"),
+        "buffered": packet.get("buffered"),
+        "buffer_count": packet.get("buffer_count"),
+        "retry_count": packet.get("retry_count"),
+        "phone_connected": packet.get("phone_connected"),
+        "relay_streaming": packet.get("relay_streaming"),
+        "ack_pending": packet.get("ack_pending"),
+        "battery_status_label": "Battery is not connected" if packet.get("battery_pct") is not None and packet.get("battery_pct") < 0 else None,
         "updated_at": timestamp,
     }
+    display = display or {}
+    update.update(build_worn_time_alias_fields(display.get("wearing_today_sec", 0)))
+    update["wearing_today_label"] = display.get("wearing_today_label", "0m")
+    update["worn_today_label"] = display.get("wearing_today_label", "0m")
     ref.update({k: v for k, v in update.items() if v is not None})
 
 
@@ -1075,7 +1395,8 @@ def enqueue_vital_reading(uid: str, device_id: str, packet: Dict[str, Any],
         "source_type": SOURCE_TYPE_RELAY,
         "source_path": SOURCE_PATH_RELAY,
         "transport_mode": packet.get("transport_mode", "BLE_RELAY"),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": packet.get("schema_version", SCHEMA_VERSION),
+        "backend_schema_version": SCHEMA_VERSION,
         "relay_uploaded_at": timestamp,
         "app_sent_at": packet.get("app_sent_at"),
         "render_received_at": timestamp,
@@ -1109,7 +1430,8 @@ def enqueue_vital_reading_force(uid: str, device_id: str, packet: Dict[str, Any]
         "source_type": SOURCE_TYPE_RELAY,
         "source_path": SOURCE_PATH_RELAY,
         "transport_mode": packet.get("transport_mode", "BLE_RELAY"),
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": packet.get("schema_version", SCHEMA_VERSION),
+        "backend_schema_version": SCHEMA_VERSION,
         "relay_uploaded_at": timestamp,
         "app_sent_at": packet.get("app_sent_at"),
         "render_received_at": timestamp,
@@ -1278,6 +1600,14 @@ def process_live_relay_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
             "packet_id": packet_id,
             "connection_mode_written": None,
             "history_sync": history_sync_snapshot(),
+            "delivery_ack": build_delivery_ack(
+                packet_id, device_id,
+                accepted=True,
+                duplicate=True,
+                live_written=False,
+                connection_mode_written=None,
+                ack_level="render_duplicate_already_seen",
+            ),
         }
 
     # ── Sensor validation ────────────────────────────────────
@@ -1293,11 +1623,21 @@ def process_live_relay_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Read current Firebase status (Pi handover + primary protection) ──
     current_status = read_current_firebase_status(uid, device_id)
+    current_vitals = read_current_firebase_vitals(uid, device_id)
     pi_handover = is_pi_handover_active(current_status)
     primary_active = is_primary_active(current_status)
     prev_mode = current_status.get("connection_mode")
+
+    permit_live_write, packet_lane, live_protection_reason = should_write_live_for_lane(
+        current_status,
+        packet,
+        payload,
+        current_vitals=current_vitals,
+        now_ms=request_start_ms,
+    )
+    packet["_live_lane_role"] = packet_lane
+    packet["_continuity_sample"] = packet_lane == "continuity"
     permit_relay_write = should_render_write_relay(current_status, packet, payload)
-    permit_live_write = should_write_live_rtdb(current_status, packet, payload)
 
     # ── Compute analytics ─────────────────────────────────────
     if packet["wearing"]:
@@ -1346,20 +1686,34 @@ def process_live_relay_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
                 })
                 protection_reason = "pi_handover_active"
             else:
-                # Primary protected: skip ALL live RTDB writes (vitals/device/alerts/status).
-                log.info("[RELAY] Primary protected — history only uid=%s device=%s", uid, device_id)
-                protection_reason = "primary_protected"
+                # History-only or protected continuity packet: queue history/backfill but do not
+                # overwrite RTDB live data with older samples.
+                protection_reason = live_protection_reason
+                log.info(
+                    "[RELAY] Live lane skipped uid=%s device=%s lane=%s reason=%s",
+                    uid, device_id, packet_lane, protection_reason,
+                )
 
         else:
             # ── Write RTDB live data ─────────────────────────
             write_vitals_branch(uid, device_id, packet, display, confidence, quality, timestamp, packet_id)
-            write_device_branch(uid, device_id, packet, timestamp)
+            write_device_branch(uid, device_id, packet, timestamp, display)
             write_alerts_branch(uid, device_id, fusion, timestamp)
+            write_queue_branch(
+                uid,
+                device_id,
+                queue_depth=local_queue.count(),
+                queue_oldest_ms=local_queue.oldest_age_ms(),
+                sync_status=history_sync_snapshot().get("history_sync_status", "ok"),
+            )
 
             # ── Status branch ────────────────────────────────
             if permit_relay_write:
                 write_status_branch(uid, device_id, timestamp, "relay", request_id,
-                                    transport_mode=packet.get("transport_mode", "BLE_PHONE_RELAY"))
+                                    transport_mode=packet.get("transport_mode", "BLE_PHONE_RELAY"),
+                                    schema_version=packet.get("schema_version", SCHEMA_VERSION),
+                                    packet=packet,
+                                    display=display)
                 connection_mode_written = "relay"
 
                 # Write mode_history only if mode actually changed.
@@ -1376,8 +1730,16 @@ def process_live_relay_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
         write_done_ms = int(time.time() * 1000)
 
         # ── Firestore history + logs ─────────────────────────
-        enqueue_vital_reading(uid, device_id, packet, display, confidence, quality,
-                               packet_id, timestamp, state)
+        # Live packets are throttled for history to protect Firestore.
+        # Queued/backfill packets are stored unconditionally because they already
+        # represent offline data that must be preserved.
+        if packet.get("is_queued"):
+            enqueue_vital_reading_force(
+                uid, device_id, packet, display, confidence, quality, packet_id, timestamp
+            )
+        else:
+            enqueue_vital_reading(uid, device_id, packet, display, confidence, quality,
+                                   packet_id, timestamp, state)
         enqueue_alert_log_if_needed(uid, device_id, fusion, packet, packet_id, timestamp, state)
         enqueue_relay_activated_log(uid, device_id, packet, packet_id, timestamp, request_id, state)
         enqueue_fault_log_if_needed(uid, device_id, packet, packet_id, timestamp)
@@ -1406,6 +1768,20 @@ def process_live_relay_packet(payload: Dict[str, Any]) -> Dict[str, Any]:
             "live_written": permit_live_write,
             "deduplicated": False,
             "packet_id": packet_id,
+            "delivery_ack": build_delivery_ack(
+                packet_id, device_id,
+                accepted=True,
+                duplicate=False,
+                live_written=permit_live_write,
+                connection_mode_written=connection_mode_written,
+                protection_reason=protection_reason,
+                ack_level=(
+                    "render_live_lane_written"
+                    if permit_live_write else
+                    "render_history_backfill_queued"
+                ),
+            ),
+            "live_lane_role": packet_lane,
             "history_sync": {
                 "status": "ok",
                 "queue_depth": local_queue.count(),
@@ -1576,6 +1952,14 @@ def handle_offline_sync_packet(data: Dict[str, Any]) -> Dict[str, Any]:
             "deduplicated": True,
             "packet_id": packet_id,
             "status": "duplicate",
+            "delivery_ack": build_delivery_ack(
+                packet_id, device_id,
+                accepted=True,
+                duplicate=True,
+                live_written=False,
+                connection_mode_written=None,
+                ack_level="offline_packet_duplicate_already_seen",
+            ),
         }
 
     confidence = compute_confidence(state, packet["heart_rate"], packet["spo2"], packet["wearing"])
@@ -1594,15 +1978,42 @@ def handle_offline_sync_packet(data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         log.warning("[OFFLINE_PACKET] Queue RTDB update failed: %s", exc)
 
-    # Optionally update live RTDB vitals if this is the newest packet and marked latest_live
-    if packet.get("latest_live"):
-        try:
-            current_vitals = rtdb.reference(f"live/{uid}/{device_id}/vitals").get() or {}
-            current_ts = current_vitals.get("updated_at", "")
-            if not current_ts or timestamp >= current_ts:
-                write_vitals_branch(uid, device_id, packet, display, confidence, quality, timestamp, packet_id)
-        except Exception as exc:
-            log.warning("[OFFLINE_PACKET] latest_live vitals write failed: %s", exc)
+    # Live-lane rule for offline sync:
+    # - Old queued packets are history-only.
+    # - A continuity/latest queued packet may update RTDB live only when there is
+    #   no fresher live reading already present.
+    live_written = False
+    packet_lane = "history"
+    live_reason = "queued_history_only"
+    try:
+        current_status = read_current_firebase_status(uid, device_id)
+        current_vitals = read_current_firebase_vitals(uid, device_id)
+        live_written, packet_lane, live_reason = should_write_live_for_lane(
+            current_status,
+            packet,
+            data,
+            current_vitals=current_vitals,
+            now_ms=int(time.time() * 1000),
+        )
+        packet["_live_lane_role"] = packet_lane
+        packet["_continuity_sample"] = packet_lane == "continuity"
+
+        if live_written:
+            write_vitals_branch(uid, device_id, packet, display, confidence, quality, timestamp, packet_id)
+            write_device_branch(uid, device_id, packet, timestamp, display)
+            write_alerts_branch(
+                uid,
+                device_id,
+                local_fusion(
+                    packet["heart_rate"], packet["spo2"], packet["temperature"], packet["wearing"],
+                    packet["imu_candidate"], packet["hr_spike"], packet["spo2_drop"], packet["fault_flags"],
+                ),
+                timestamp,
+            )
+    except Exception as exc:
+        live_written = False
+        live_reason = f"live_lane_update_failed: {str(exc)[:120]}"
+        log.warning("[OFFLINE_PACKET] live-lane update failed: %s", exc)
 
     state.daily_readings += 1
 
@@ -1611,6 +2022,20 @@ def handle_offline_sync_packet(data: Dict[str, Any]) -> Dict[str, Any]:
         "deduplicated": False,
         "packet_id": packet_id,
         "status": "accepted",
+        "live_lane_role": packet_lane,
+        "live_write_reason": live_reason,
+        "delivery_ack": build_delivery_ack(
+            packet_id, device_id,
+            accepted=True,
+            duplicate=False,
+            live_written=live_written,
+            connection_mode_written=None,
+            ack_level=(
+                "offline_packet_live_lane_written"
+                if live_written else
+                "offline_packet_history_queued"
+            ),
+        ),
     }
 
 
@@ -1915,6 +2340,11 @@ def health():
         "api_key_configured": api_key_configured,
         "insecure_dev_mode": insecure_dev_mode,
         "history_sync": history_sync_snapshot(),
+        "transport_security": {
+            "app_to_render": "https_required_by_render_plus_api_key",
+            "render_to_firebase": "firebase_admin_sdk_tls_service_account",
+            "esp_payload_security": "aes128_ctr_hmac_before_phone_or_pi_decrypt",
+        },
     })
 
 
